@@ -221,7 +221,7 @@ static VALUE _native_reset_after_fork(DDTRACE_UNUSED VALUE self, VALUE recorder_
 static void serializer_set_start_timestamp_for_next_profile(struct stack_recorder_state *state, ddog_Timespec start_time);
 static VALUE _native_record_endpoint(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE local_root_span_id, VALUE endpoint);
 static void reset_profile(ddog_prof_Profile *profile, ddog_Timespec *start_time /* Can be null */);
-static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight);
+static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight, VALUE alloc_class);
 static VALUE _native_record_obj_free(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE obj);
 
 
@@ -247,7 +247,7 @@ void stack_recorder_init(VALUE profiling_module) {
   rb_define_singleton_method(testing_module, "_native_slot_one_mutex_locked?", _native_is_slot_one_mutex_locked, 1);
   rb_define_singleton_method(testing_module, "_native_slot_two_mutex_locked?", _native_is_slot_two_mutex_locked, 1);
   rb_define_singleton_method(testing_module, "_native_record_endpoint", _native_record_endpoint, 3);
-  rb_define_singleton_method(testing_module, "_native_track_obj_allocation", _native_track_obj_allocation, 3);
+  rb_define_singleton_method(testing_module, "_native_track_obj_allocation", _native_track_obj_allocation, 4);
   rb_define_singleton_method(testing_module, "_native_record_obj_free", _native_record_obj_free, 2);
 
   ok_symbol = ID2SYM(rb_intern_const("ok"));
@@ -512,7 +512,7 @@ void record_sample(VALUE recorder_instance, ddog_prof_Slice_Location locations, 
   }
 }
 
-void track_object(VALUE recorder_instance, VALUE new_object, unsigned int sample_weight) {
+void track_object(VALUE recorder_instance, VALUE new_object, unsigned int sample_weight, ddog_CharSlice alloc_class) {
   struct stack_recorder_state *state;
   TypedData_Get_Struct(recorder_instance, struct stack_recorder_state, &stack_recorder_typed_data, state);
   if (state->heap_recorder == NULL) {
@@ -522,7 +522,7 @@ void track_object(VALUE recorder_instance, VALUE new_object, unsigned int sample
   // FIXME: Heap sampling currently has to be done in 2 parts because the construction of locations is happening
   //        very late in the allocation-sampling path (which is shared with the cpu sampling path). This can
   //        be fixed with some refactoring but for now this leads to a less impactful change.
-  start_heap_allocation_recording(state->heap_recorder, new_object, sample_weight);
+  start_heap_allocation_recording(state->heap_recorder, new_object, sample_weight, alloc_class);
 }
 
 // WARN: This can get called during Ruby GC. NO HEAP ALLOCATIONS OR EXCEPTIONS ARE ALLOWED.
@@ -556,6 +556,7 @@ void record_endpoint(VALUE recorder_instance, uint64_t local_root_span_id, ddog_
 typedef struct heap_recorder_iteration_context {
   struct stack_recorder_state *state;
   ddog_prof_Profile *profile;
+  size_t profile_gen;
 } heap_recorder_iteration_context;
 
 static void add_heap_sample_to_active_profile_without_gvl(heap_recorder_iteration_data iteration_data, void *extra_arg) {
@@ -566,11 +567,31 @@ static void add_heap_sample_to_active_profile_without_gvl(heap_recorder_iteratio
 
   metric_values[position_for[HEAP_SAMPLES_VALUE_ID]] = iteration_data.object_data.weight;
 
+  live_object_data object_data = iteration_data.object_data;
+  ddog_prof_Label labels[2];
+  size_t num_labels = 2;
+
+  labels[0] = (ddog_prof_Label ){
+    .key = DDOG_CHARSLICE_C("allocation class"),
+    .str = (ddog_CharSlice) {
+      .ptr = object_data.alloc_class,
+      .len = strlen(object_data.alloc_class),
+    },
+  };
+  labels[1] = (ddog_prof_Label ){
+    .key = DDOG_CHARSLICE_C("gc gen age"),
+    .num = context->profile_gen - object_data.alloc_gen,
+  };
+
   ddog_prof_Profile_Result result = ddog_prof_Profile_add(
     context->profile,
     (ddog_prof_Sample) {
       .locations = iteration_data.locations,
       .values = (ddog_Slice_I64) {.ptr = metric_values, .len = context->state->enabled_values_count},
+      .labels = (ddog_prof_Slice_Label) {
+        .ptr = labels,
+        .len = num_labels,
+      }
     },
     0
   );
@@ -583,7 +604,8 @@ static void add_heap_sample_to_active_profile_without_gvl(heap_recorder_iteratio
 static void build_heap_profile_without_gvl(struct stack_recorder_state *state, ddog_prof_Profile *profile) {
   heap_recorder_iteration_context iteration_context = {
     .state = state,
-    .profile = profile
+    .profile = profile,
+    .profile_gen = rb_gc_count(),
   };
   heap_recorder_for_each_live_object(state->heap_recorder, add_heap_sample_to_active_profile_without_gvl, (void*) &iteration_context, false);
 }
@@ -740,9 +762,9 @@ static VALUE _native_record_endpoint(DDTRACE_UNUSED VALUE _self, VALUE recorder_
   return Qtrue;
 }
 
-static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight) {
+static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight, VALUE alloc_class) {
   ENFORCE_TYPE(weight, T_FIXNUM);
-  track_object(recorder_instance, new_obj, NUM2UINT(weight));
+  track_object(recorder_instance, new_obj, NUM2UINT(weight), char_slice_from_ruby_string(alloc_class));
   return Qtrue;
 }
 

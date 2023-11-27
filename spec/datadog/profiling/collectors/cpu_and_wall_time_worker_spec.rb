@@ -526,16 +526,17 @@ RSpec.describe 'Datadog::Profiling::Collectors::CpuAndWallTimeWorker' do
 
         test_struct_new_location_matcher = lambda { |sample|
           first_frame = sample.locations.first
-          first_frame.lineno == allocation_line && first_frame.path == __FILE__ && first_frame.base_label == 'new'
+          first_frame.lineno == allocation_line &&
+            first_frame.path == __FILE__ &&
+            first_frame.base_label == 'new' &&
+            sample.labels[:'allocation class'] == 'CpuAndWallTimeWorkerSpec::TestStruct'
         }
 
         total_heap_sampled_for_test_struct = samples_from_pprof(recorder.serialize!)
           .filter(&test_struct_new_location_matcher)
           .sum { |s| s.values[:'heap-live-samples'] }
 
-        # FIXME: When we have the allocated class label, tighten test_struct_new_location_matcher to prevent
-        #        matching against allocation class `(VM Internal, T_IMEMO)` which the +1 accounts for here
-        expect(total_heap_sampled_for_test_struct).to eq test_num_allocated_object + 1
+        expect(total_heap_sampled_for_test_struct).to eq test_num_allocated_object
       end
 
       context 'but allocation profiling is disabled' do

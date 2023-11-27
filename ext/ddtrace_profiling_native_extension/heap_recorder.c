@@ -1,9 +1,9 @@
 #include "heap_recorder.h"
 #include <pthread.h>
 #include "ruby/st.h"
-#include "ruby/util.h"
 #include "ruby_helpers.h"
 #include <errno.h>
+#include "libdatadog_helpers.h"
 
 #define MAX_FRAMES_LIMIT 10000
 #define MAX_QUEUE_LIMIT 10000
@@ -184,11 +184,13 @@ void heap_recorder_free(struct heap_recorder* recorder) {
   ruby_xfree(recorder);
 }
 
-void start_heap_allocation_recording(heap_recorder* heap_recorder, VALUE new_obj, unsigned int weight) {
+void start_heap_allocation_recording(heap_recorder* heap_recorder, VALUE new_obj, unsigned int weight, ddog_CharSlice alloc_class) {
   heap_recorder->active_recording = (partial_heap_recording) {
     .obj = new_obj,
     .object_data = (live_object_data) {
       .weight = weight,
+      .alloc_class = string_from_char_slice(alloc_class),
+      .alloc_gen = rb_gc_count(),
     },
   };
 }
@@ -530,6 +532,14 @@ static void enqueue_sample(heap_recorder *heap_recorder, uncommitted_sample new_
     // FIXME: If we're droppping a free sample here, the accuracy of our heap profiles will be affected.
     // Should we completely give up and stop sending heap profiles or should we trigger a flag that we
     // can then use to add a warning in the UI? At the very least we'd want telemetry here.
+
+    // If this sample had dynamic data in its object data, we need to free it
+    // TODO: Maybe create an explicit object_data or uncommitted_sample API to encode this?
+    //       For now that seems slightly overkill. Maybe we if we add more labels?
+    if (new_sample.object_data.alloc_class != NULL) {
+      ruby_xfree(new_sample.object_data.alloc_class);
+    }
+
     return;
   }
 
@@ -585,6 +595,7 @@ object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_o
 }
 
 void object_record_free(object_record *record) {
+  ruby_xfree(record->object_data.alloc_class);
   ruby_xfree(record);
 }
 
@@ -629,7 +640,6 @@ st_index_t ddog_location_hash(ddog_prof_Location location, st_index_t seed) {
   return hash;
 }
 
-
 // ==============
 // Heap Stack API
 // ==============
@@ -642,8 +652,8 @@ heap_stack* heap_stack_new(ddog_prof_Slice_Location locations) {
   for (uint64_t i = 0; i < locations.len; i++) {
     const ddog_prof_Location *location = &locations.ptr[i];
     stack->frames[i] = (heap_frame) {
-      .name = ruby_strndup(location->function.name.ptr, location->function.name.len),
-      .filename = ruby_strndup(location->function.filename.ptr, location->function.filename.len),
+      .name = string_from_char_slice(location->function.name),
+      .filename = string_from_char_slice(location->function.filename),
       .line = location->line,
     };
   }

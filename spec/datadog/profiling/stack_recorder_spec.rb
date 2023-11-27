@@ -362,7 +362,7 @@ RSpec.describe Datadog::Profiling::StackRecorder do
       before do
         allocated_objects.each_with_index do |obj, i|
           # Heap sampling currently requires this 2-step process to first pass data about the allocated object...
-          described_class::Testing._native_track_obj_allocation(stack_recorder, obj, sample_rate)
+          described_class::Testing._native_track_obj_allocation(stack_recorder, obj, sample_rate, obj.class.name)
           # ...and then pass data about the allocation stacktrace (with 2 distinct stacktraces)
           if i.even?
             Datadog::Profiling::Collectors::Stack::Testing
@@ -394,7 +394,9 @@ RSpec.describe Datadog::Profiling::StackRecorder do
         it 'are included in the profile' do
           # We sample from 2 distinct locations but heap samples don't have the same
           # labels as the others so they get duped.
-          expect(samples.size).to eq(4)
+          # Among the dupes they all have different allocation classes so we actually
+          # get 3 extra samplespect(samples.size).t
+          expect(samples.size).to eq(5)
 
           expect(samples.sum { |s| s.values[:'heap-live-samples'] || 0 }).to eq(
             [a_string, an_array, a_hash].size * sample_rate

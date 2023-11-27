@@ -67,3 +67,7 @@ void grab_gvl_and_raise_ddogerr_and_drop(const char *while_context, ddog_Error *
   ddog_Error_drop(error);
   grab_gvl_and_raise(rb_eRuntimeError, "Libstreaming error while (%s): %s", while_context, error_msg);
 }
+
+char* string_from_char_slice(ddog_CharSlice slice) {
+  return ruby_strndup(slice.ptr, slice.len);
+}
