@@ -86,9 +86,10 @@ static void heap_record_free(heap_record*);
 typedef struct {
   VALUE obj;
   heap_record *heap_record;
-  live_object_data object_data;
+  // Has ownership of this, needs to clean-it-up if not transferred.
+  live_object_data *object_data;
 } object_record;
-static object_record* object_record_new(VALUE, heap_record*, live_object_data);
+static object_record* object_record_new(VALUE, heap_record*, live_object_data*);
 static void object_record_free(object_record*);
 
 // Allows storing data passed to ::start_heap_allocation_recording to make it accessible to
@@ -97,14 +98,16 @@ static void object_record_free(object_record*);
 // obj != Qnil flags this struct as holding a valid partial heap recording.
 typedef struct {
   VALUE obj;
-  live_object_data object_data;
+  // Has ownership of this, needs to clean-it-up if not transferred.
+  live_object_data *object_data;
 } partial_heap_recording;
 
 typedef struct {
   // Has ownership of this, needs to clean-it-up if not transferred.
   heap_stack *stack;
   VALUE obj;
-  live_object_data object_data;
+  // Has ownership of this, needs to clean-it-up if not transferred.
+  live_object_data *object_data;
   bool free;
   bool skip;
 } uncommitted_sample;
@@ -137,13 +140,15 @@ static int st_heap_record_entry_free(st_data_t, st_data_t, st_data_t);
 static int st_object_record_entry_free(st_data_t, st_data_t, st_data_t);
 static int st_object_records_iterate(st_data_t, st_data_t, st_data_t);
 static int update_object_record_entry(st_data_t*, st_data_t*, st_data_t, int);
-static void commit_allocation_with_heap_stack(heap_recorder*, heap_stack*, VALUE, live_object_data);
-static void commit_allocation_with_heap_record(heap_recorder*, heap_record*, VALUE, live_object_data);
+static void commit_allocation_with_heap_stack(heap_recorder*, heap_stack*, VALUE, live_object_data*);
+static void commit_allocation_with_heap_record(heap_recorder*, heap_record*, VALUE, live_object_data*);
 static void commit_free(heap_recorder*, VALUE, object_record*);
 static void flush_queue(heap_recorder*);
 static void enqueue_sample(heap_recorder*, uncommitted_sample);
-static void enqueue_allocation(heap_recorder*, heap_stack*, VALUE, live_object_data);
+static void enqueue_allocation(heap_recorder*, heap_stack*, VALUE, live_object_data*);
 static void enqueue_free(heap_recorder*, VALUE);
+static live_object_data* live_object_data_new(unsigned int, ddog_CharSlice, size_t);
+static void live_object_data_free(live_object_data*);
 
 // ==========================
 // Heap Recorder External API
@@ -161,7 +166,7 @@ heap_recorder* heap_recorder_new(void) {
   recorder->reusable_locations = ruby_xcalloc(MAX_FRAMES_LIMIT, sizeof(ddog_prof_Location));
   recorder->active_recording = (partial_heap_recording) {
     .obj = Qnil,
-    .object_data = {0},
+    .object_data = NULL,
   };
   recorder->queued_samples = ruby_xcalloc(MAX_QUEUE_LIMIT, sizeof(uncommitted_sample));
   recorder->queued_samples_len = 0;
@@ -187,11 +192,7 @@ void heap_recorder_free(struct heap_recorder* recorder) {
 void start_heap_allocation_recording(heap_recorder* heap_recorder, VALUE new_obj, unsigned int weight, ddog_CharSlice alloc_class) {
   heap_recorder->active_recording = (partial_heap_recording) {
     .obj = new_obj,
-    .object_data = (live_object_data) {
-      .weight = weight,
-      .alloc_class = string_from_char_slice(alloc_class),
-      .alloc_gen = rb_gc_count(),
-    },
+    .object_data = live_object_data_new(weight, alloc_class, rb_gc_count()),
   };
 }
 
@@ -231,7 +232,8 @@ void end_heap_allocation_recording(struct heap_recorder *heap_recorder, ddog_pro
       heap_stack *stack = heap_stack_new(locations);
       enqueue_allocation(heap_recorder, stack, new_obj, active_recording->object_data);
     } else {
-      // Something unexpected happened, lets error out
+      // Something unexpected happened, lets error out after cleaning up pending stuff.
+      live_object_data_free(active_recording->object_data);
       ENFORCE_SUCCESS_GVL(error)
     }
     return;
@@ -398,8 +400,9 @@ static int update_object_record_entry(st_data_t *key, st_data_t *value, st_data_
   return ST_CONTINUE;
 }
 
+// Expects transfer of ownership of object_data
 // WARN: Expects records_mutex to be held
-static void commit_allocation_with_heap_record(heap_recorder *heap_recorder, heap_record *heap_record, VALUE obj, live_object_data object_data) {
+static void commit_allocation_with_heap_record(heap_recorder *heap_recorder, heap_record *heap_record, VALUE obj, live_object_data *object_data) {
   // Mark the heap record as having an extra tracked object linked to it
   // NOTE: Do this before the call to ::update_object_record_entry because that call could
   // be a bundled free+allocation and could thus lead to cleanup of this heap_record if
@@ -445,9 +448,10 @@ static int update_heap_record_entry_with_new_allocation(st_data_t *key, st_data_
 }
 
 // This version assumes that a new stack got created and there's an expectation of transfer of ownership of
-// it to this function. For stack re-use you should be using ::commit_allocation_with_heap_record.
+// it to this function. For stack re-use you should be using ::commit_allocation_with_heap_record. There's
+// also an expectation of transfer of ownership for the object_data parameter.
 // WARN: Expects records_mutex to be held
-static void commit_allocation_with_heap_stack(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj, live_object_data object_data) {
+static void commit_allocation_with_heap_stack(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj, live_object_data *object_data) {
   // First lets update the heap_records with this stack info
   // NOTE: Using a stack-allocated key here for easy cleanup logic. The update function will create a heap-allocated key
   // if no matching heap_record exists.
@@ -522,6 +526,7 @@ static void flush_queue(heap_recorder *heap_recorder) {
   heap_recorder->queued_samples_len = 0;
 }
 
+// Expects transfer of ownership of data in new_sample.
 // WARN: This can get called during Ruby GC. NO HEAP ALLOCATIONS OR EXCEPTIONS ARE ALLOWED.
 static void enqueue_sample(heap_recorder *heap_recorder, uncommitted_sample new_sample) {
   if (heap_recorder->queued_samples_len >= MAX_QUEUE_LIMIT) {
@@ -529,11 +534,9 @@ static void enqueue_sample(heap_recorder *heap_recorder, uncommitted_sample new_
     // Should we completely give up and stop sending heap profiles or should we trigger a flag that we
     // can then use to add a warning in the UI? At the very least we'd want telemetry here.
 
-    // If this sample had dynamic data in its object data, we need to free it
-    // TODO: Maybe create an explicit object_data or uncommitted_sample API to encode this?
-    //       For now that seems slightly overkill. Maybe we if we add more labels?
-    if (new_sample.object_data.alloc_class != NULL) {
-      ruby_xfree(new_sample.object_data.alloc_class);
+    // If this sample had object data in it, we need to free it since it won't be used anymore
+    if (new_sample.object_data != NULL) {
+      live_object_data_free(new_sample.object_data);
     }
 
     return;
@@ -543,7 +546,8 @@ static void enqueue_sample(heap_recorder *heap_recorder, uncommitted_sample new_
   heap_recorder->queued_samples_len++;
 }
 
-static void enqueue_allocation(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj, live_object_data object_data) {
+// Expects transfer of ownership of heap_stack and object_data
+static void enqueue_allocation(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj, live_object_data *object_data) {
   enqueue_sample(heap_recorder, (uncommitted_sample) {
       .stack = heap_stack,
       .obj = obj,
@@ -558,10 +562,24 @@ static void enqueue_free(heap_recorder *heap_recorder, VALUE obj) {
   enqueue_sample(heap_recorder, (uncommitted_sample) {
       .stack = NULL,
       .obj = obj,
-      .object_data = {0},
+      .object_data = NULL,
       .free = true,
       .skip = false,
   });
+}
+
+static live_object_data* live_object_data_new(unsigned int weight, ddog_CharSlice alloc_class, size_t alloc_gen) {
+  live_object_data* object_data = ruby_xmalloc(sizeof(live_object_data));
+  (*object_data) = (live_object_data) {
+    .weight = weight,
+    .alloc_class = string_from_char_slice(alloc_class),
+    .alloc_gen = alloc_gen,
+  };
+  return object_data;
+}
+
+static void live_object_data_free(live_object_data *object_data) {
+  ruby_xfree(object_data->alloc_class);
 }
 
 // ===============
@@ -583,7 +601,7 @@ void heap_record_free(heap_record *record) {
 // =================
 // Object Record API
 // =================
-object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_object_data object_data) {
+object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_object_data *object_data) {
   object_record* record = ruby_xcalloc(1, sizeof(object_record));
   record->heap_record = heap_record;
   record->object_data = object_data;
@@ -591,7 +609,7 @@ object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_o
 }
 
 void object_record_free(object_record *record) {
-  ruby_xfree(record->object_data.alloc_class);
+  live_object_data_free(record->object_data);
   ruby_xfree(record);
 }
 

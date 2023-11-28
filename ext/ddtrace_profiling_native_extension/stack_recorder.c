@@ -565,22 +565,22 @@ static void add_heap_sample_to_active_profile_without_gvl(heap_recorder_iteratio
   int64_t metric_values[ALL_VALUE_TYPES_COUNT] = {0};
   uint8_t *position_for = context->state->position_for;
 
-  metric_values[position_for[HEAP_SAMPLES_VALUE_ID]] = iteration_data.object_data.weight;
+  metric_values[position_for[HEAP_SAMPLES_VALUE_ID]] = iteration_data.object_data->weight;
 
-  live_object_data object_data = iteration_data.object_data;
+  const live_object_data *object_data = iteration_data.object_data;
   ddog_prof_Label labels[2];
   size_t num_labels = 2;
 
   labels[0] = (ddog_prof_Label ){
     .key = DDOG_CHARSLICE_C("allocation class"),
     .str = (ddog_CharSlice) {
-      .ptr = object_data.alloc_class,
-      .len = strlen(object_data.alloc_class),
+      .ptr = object_data->alloc_class,
+      .len = strlen(object_data->alloc_class),
     },
   };
   labels[1] = (ddog_prof_Label ){
     .key = DDOG_CHARSLICE_C("gc gen age"),
-    .num = context->profile_gen - object_data.alloc_gen,
+    .num = context->profile_gen - object_data->alloc_gen,
   };
 
   ddog_prof_Profile_Result result = ddog_prof_Profile_add(

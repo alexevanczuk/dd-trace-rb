@@ -37,7 +37,7 @@ typedef struct live_object_data {
 // tracked therein.
 typedef struct {
   ddog_prof_Slice_Location locations;
-  live_object_data object_data;
+  const live_object_data *object_data;
 } heap_recorder_iteration_data;
 
 // Initialize a new heap recorder.
