@@ -533,7 +533,7 @@ RSpec.describe 'Datadog::Profiling::Collectors::CpuAndWallTimeWorker' do
         }
 
         total_heap_sampled_for_test_struct = samples_from_pprof(recorder.serialize!)
-          .filter(&test_struct_new_location_matcher)
+          .select(&test_struct_new_location_matcher)
           .sum { |s| s.values[:'heap-live-samples'] }
 
         expect(total_heap_sampled_for_test_struct).to eq test_num_allocated_object
