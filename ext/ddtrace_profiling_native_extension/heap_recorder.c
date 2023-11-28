@@ -1,7 +1,6 @@
 #include "heap_recorder.h"
 #include <pthread.h>
 #include "ruby/st.h"
-#include "ruby/util.h"
 #include "ruby_helpers.h"
 #include <errno.h>
 
@@ -83,19 +82,20 @@ static void heap_record_free(heap_record*);
 
 // An object record is used for storing data about currently tracked live objects
 typedef struct {
-  VALUE obj;
+  VALUE obj_id;
   heap_record *heap_record;
   live_object_data object_data;
 } object_record;
 static object_record* object_record_new(VALUE, heap_record*, live_object_data);
 static void object_record_free(object_record*);
+static void object_record_mark(object_record*);
 
 // Allows storing data passed to ::start_heap_allocation_recording to make it accessible to
 // ::end_heap_allocation_recording.
 //
 // obj != Qnil flags this struct as holding a valid partial heap recording.
 typedef struct {
-  VALUE obj;
+  VALUE obj_id;
   live_object_data object_data;
 } partial_heap_recording;
 
@@ -105,7 +105,7 @@ struct heap_recorder {
   // via heap_record_key.type == LOCATION_SLICE to allow for allocation-free fast-paths.
   st_table *heap_records;
 
-  // Map[obj: VALUE, record: object_record*]
+  // Map[obj_id: VALUE, record: object_record*]
   st_table *object_records;
 
   // Lock protecting writes to above record tables
@@ -119,11 +119,12 @@ struct heap_recorder {
 };
 static int st_heap_record_entry_free(st_data_t, st_data_t, st_data_t);
 static int st_object_record_entry_free(st_data_t, st_data_t, st_data_t);
+static int st_object_record_entry_free_if_invalid(st_data_t, st_data_t, st_data_t);
+static int st_object_record_entry_mark(st_data_t, st_data_t, st_data_t);
 static int st_object_records_iterate(st_data_t, st_data_t, st_data_t);
 static int update_object_record_entry(st_data_t*, st_data_t*, st_data_t, int);
 static void commit_allocation_with_heap_stack(heap_recorder*, heap_stack*, VALUE, live_object_data);
 static void commit_allocation_with_heap_record(heap_recorder*, heap_record*, VALUE, live_object_data);
-static void commit_free(heap_recorder*, VALUE, object_record*);
 
 // ==========================
 // Heap Recorder External API
@@ -140,14 +141,14 @@ heap_recorder* heap_recorder_new(void) {
   recorder->object_records = st_init_numtable();
   recorder->reusable_locations = ruby_xcalloc(MAX_FRAMES_LIMIT, sizeof(ddog_prof_Location));
   recorder->active_recording = (partial_heap_recording) {
-    .obj = Qnil,
+    .obj_id = Qnil,
     .object_data = {0},
   };
 
   return recorder;
 }
 
-void heap_recorder_free(struct heap_recorder* recorder) {
+void heap_recorder_free(heap_recorder* recorder) {
   st_foreach(recorder->object_records, st_object_record_entry_free, 0);
   st_free_table(recorder->object_records);
 
@@ -161,9 +162,13 @@ void heap_recorder_free(struct heap_recorder* recorder) {
   ruby_xfree(recorder);
 }
 
+void heap_recorder_mark(heap_recorder *recorder) {
+  st_foreach(recorder->object_records, st_object_record_entry_mark, 0);
+}
+
 void start_heap_allocation_recording(heap_recorder* heap_recorder, VALUE new_obj, unsigned int weight) {
   heap_recorder->active_recording = (partial_heap_recording) {
-    .obj = new_obj,
+    .obj_id = rb_obj_id(new_obj),
     .object_data = (live_object_data) {
       .weight = weight,
     },
@@ -173,15 +178,15 @@ void start_heap_allocation_recording(heap_recorder* heap_recorder, VALUE new_obj
 void end_heap_allocation_recording(struct heap_recorder *heap_recorder, ddog_prof_Slice_Location locations) {
   partial_heap_recording *active_recording = &heap_recorder->active_recording;
 
-  VALUE new_obj = active_recording->obj;
-  if (new_obj == Qnil) {
+  VALUE obj_id = active_recording->obj_id;
+  if (obj_id == Qnil) {
     // Recording ended without having been started?
     rb_raise(rb_eRuntimeError, "Ended a heap recording that was not started");
   }
 
   // From now on, mark active recording as invalid so we can short-circuit at any point and
   // not end up with a still active recording. new_obj still holds the object for this recording
-  active_recording->obj = Qnil;
+  active_recording->obj_id = Qnil;
 
   // For performance reasons we use a stack-allocated location-slice based key. This allows us
   // to do allocation-free lookups and reuse of a matching existing heap record.
@@ -213,45 +218,19 @@ void end_heap_allocation_recording(struct heap_recorder *heap_recorder, ddog_pro
     // If we didn't find a matching heap record we'll need to create a new one so go with
     // new heap stack path.
     heap_stack *stack = heap_stack_new(locations);
-    commit_allocation_with_heap_stack(heap_recorder, stack, new_obj, active_recording->object_data);
+    commit_allocation_with_heap_stack(heap_recorder, stack, obj_id, active_recording->object_data);
   } else {
     // If we found an existing heap record, we can re-use it so go with existing heap record
     // path.
-    commit_allocation_with_heap_record(heap_recorder, heap_record, new_obj, active_recording->object_data);
+    commit_allocation_with_heap_record(heap_recorder, heap_record, obj_id, active_recording->object_data);
   }
 
   ENFORCE_SUCCESS_GVL(pthread_mutex_unlock(&heap_recorder->records_mutex));
 }
 
-// TODO: Remove when things get implemented
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-
-// WARN: This can get called during Ruby GC. NO HEAP ALLOCATIONS OR EXCEPTIONS ARE ALLOWED.
-void record_heap_free(heap_recorder *heap_recorder, VALUE obj) {
-  object_record *object_record = NULL;
-
-  // lookups require hashing and traversal over hash buckets but should not require doing any allocations
-  // and should thus be safe to run in GC.
-  // WARN: We assume we are under the GVL and that all mutations of object_records happen
-  // while holding the GVL so we can afford to do a lock-free lookup.
-  st_lookup(heap_recorder->object_records, (st_data_t) obj, (st_data_t*) &object_record);
-
-  if (object_record == NULL) {
-    // free of an untracked object, return early
-    return;
-  }
-
-  // If we got this far, we freed a tracked object so we need to update and remove records!
-  // TODO: Implement. We need some form of allocation-free queueing system to allow us to
-  // handle this free without doing mutations on our state while potentially inside a Ruby GC.
-}
-
 void heap_recorder_flush(heap_recorder *heap_recorder) {
-  // TODO: Implement
+  st_foreach(heap_recorder->object_records, st_object_record_entry_free_if_invalid, (st_data_t) heap_recorder);
 }
-
-#pragma GCC diagnostic pop
 
 // Internal data we need while performing iteration over live objects.
 typedef struct {
@@ -291,6 +270,47 @@ static int st_object_record_entry_free(st_data_t key, st_data_t value, st_data_t
   object_record_free((object_record *) value);
   return ST_DELETE;
 }
+
+static int st_object_record_entry_mark(st_data_t key, st_data_t value, st_data_t extra_arg) {
+  object_record_mark((object_record *) value);
+  return ST_CONTINUE;
+}
+
+static int st_object_record_entry_free_if_invalid(st_data_t key, st_data_t value, st_data_t extra_arg) {
+  VALUE obj_id = (VALUE) key;
+  object_record *record = (object_record*) value;
+  heap_recorder *recorder = (heap_recorder*) extra_arg;
+
+  if (!ruby_ref_from_id(obj_id, NULL)) {
+    // Id no longer associated with a valid ref. Need to clean things up!
+
+    // Starting with the associated heap record. There will now be one less tracked object pointing to it
+    heap_record *heap_record = record->heap_record;
+    heap_record->num_tracked_objects--;
+
+    if (heap_record->num_tracked_objects == 0) {
+      // A heap record now has 0 objects pointing to it, clean it as well!
+      heap_record_key heap_key = (heap_record_key) {
+        .type = HEAP_STACK,
+        .heap_stack = heap_record->stack,
+      };
+      // We need to access the deleted key to free it since we gave ownership of the keys to the hash.
+      // st_delete will change this pointer to point to the removed key if one is found.
+      heap_record_key *deleted_key = &heap_key;
+      if (!st_delete(recorder->heap_records, (st_data_t*) &deleted_key, NULL)) {
+        rb_raise(rb_eRuntimeError, "Found an object record associated with an untracked heap_record");
+      };
+      heap_record_key_free(deleted_key);
+      heap_record_free(heap_record);
+    }
+
+    object_record_free(record);
+    return ST_DELETE;
+  }
+
+  return ST_CONTINUE;
+}
+
 
 // WARN: This can get called outside the GVL. NO HEAP ALLOCATIONS OR EXCEPTIONS ARE ALLOWED.
 static int st_object_records_iterate(st_data_t key, st_data_t value, st_data_t extra) {
@@ -332,22 +352,7 @@ typedef struct {
 static int update_object_record_entry(st_data_t *key, st_data_t *value, st_data_t data, int existing) {
   object_record_update_data *update_data = (object_record_update_data*) data;
   if (existing) {
-    // Object was already tracked. One of 3 things could have happened:
-    //
-    // 1. Ruby did some smart memory re-use.
-    //    TODO: Research this case and document it.
-    //
-    // 2. We missed a free.
-    //    TODO: Research this case and document it.
-    //
-    // 3. An unknown thing happened.
-    //
-    // Except for #3 where we're kinda screwed anyway, dropping the existing object record is
-    // acceptable behaviour and is equivalent to treating this allocation as a combined
-    // free+allocation.
-    VALUE obj = (VALUE) (*key);
-    object_record *existing_record = (object_record*) (*value);
-    commit_free(update_data->heap_recorder, obj, existing_record);
+    rb_raise(rb_eRuntimeError, "Object ids are supposed to be unique. We got 2 allocation recordings with the same id");
   }
   // Always carry on with the update, we want the new record to be there at the end
   (*value) = (st_data_t) update_data->new_object_record;
@@ -355,18 +360,17 @@ static int update_object_record_entry(st_data_t *key, st_data_t *value, st_data_
 }
 
 // WARN: Expects records_mutex to be held
-static void commit_allocation_with_heap_record(heap_recorder *heap_recorder, heap_record *heap_record, VALUE obj, live_object_data object_data) {
-  // Mark the heap record as having an extra tracked object linked to it
-  // NOTE: Do this before the call to ::update_object_record_entry because that call could
-  // be a bundled free+allocation and could thus lead to cleanup of this heap_record if
-  // num_tracked_objects reached 0
-  heap_record->num_tracked_objects++;
-  // Then update object_records
+static void commit_allocation_with_heap_record(heap_recorder *heap_recorder, heap_record *heap_record, VALUE obj_id, live_object_data object_data) {
+  // Update object_records
   object_record_update_data update_data = (object_record_update_data) {
     .heap_recorder = heap_recorder,
-    .new_object_record = object_record_new(obj, heap_record, object_data),
+    .new_object_record = object_record_new(obj_id, heap_record, object_data),
   };
-  st_update(heap_recorder->object_records, obj, update_object_record_entry, (st_data_t) &update_data);
+  if (!st_update(heap_recorder->object_records, obj_id, update_object_record_entry, (st_data_t) &update_data)) {
+    // We are sure there was no previous record for this id so let the heap record know there now is one
+    // extra record associated with this stack.
+    heap_record->num_tracked_objects++;
+  };
 }
 
 // Struct holding data required for an update operation on heap_records
@@ -403,7 +407,7 @@ static int update_heap_record_entry_with_new_allocation(st_data_t *key, st_data_
 // This version assumes that a new stack got created and there's an expectation of transfer of ownership of
 // it to this function. For stack re-use you should be using ::commit_allocation_with_heap_record.
 // WARN: Expects records_mutex to be held
-static void commit_allocation_with_heap_stack(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj, live_object_data object_data) {
+static void commit_allocation_with_heap_stack(heap_recorder *heap_recorder, heap_stack *heap_stack, VALUE obj_id, live_object_data object_data) {
   // First lets update the heap_records with this stack info
   // NOTE: Using a stack-allocated key here for easy cleanup logic. The update function will create a heap-allocated key
   // if no matching heap_record exists.
@@ -418,47 +422,7 @@ static void commit_allocation_with_heap_stack(heap_recorder *heap_recorder, heap
   };
   st_update(heap_recorder->heap_records, (st_data_t) &lookup_key, update_heap_record_entry_with_new_allocation, (st_data_t) &update_data);
 
-  commit_allocation_with_heap_record(heap_recorder, heap_record, obj, object_data);
-}
-
-// Commits a free to our internal tracking structures.
-//
-// @param object_record
-//   Pointer to a object_record that is in the process of being updated. If NULL, assume no
-//   object_record is currently being updated so do it here. If not NULL, assume ownership
-//   is passed to this function (where we'll free it).
-//
-// WARN: Expects records_mutex to be held
-static void commit_free(heap_recorder *heap_recorder, VALUE obj, object_record *object_record) {
-  if (object_record == NULL) {
-    if (!st_delete(heap_recorder->object_records, (st_data_t*) &obj, (st_data_t*) &object_record)) {
-      // This should not be possible since we're already checking for tracked objects during the free
-      // tracepoint but just in case something bugs out, lets error out
-      rb_raise(rb_eRuntimeError, "Committing free of untracked object");
-    }
-  }
-
-  heap_record *heap_record = object_record->heap_record;
-  heap_record->num_tracked_objects--;
-
-  if (heap_record->num_tracked_objects == 0) {
-    heap_record_key heap_key = (heap_record_key) {
-      .type = HEAP_STACK,
-      .heap_stack = heap_record->stack,
-    };
-    // We need to access the deleted key to free it since we gave ownership of the keys to the hash.
-    // st_delete will change this pointer to point to the removed key if one is found.
-    // NOTE: We don't do this above with the object_records delete because the VALUE keys are not
-    // owned by us.
-    heap_record_key *deleted_key = &heap_key;
-    if (!st_delete(heap_recorder->heap_records, (st_data_t*) &deleted_key, NULL)) {
-      rb_raise(rb_eRuntimeError, "Found an object record associated with an untracked heap_record");
-    };
-    heap_record_key_free(deleted_key);
-    heap_record_free(heap_record);
-  }
-
-  object_record_free(object_record);
+  commit_allocation_with_heap_record(heap_recorder, heap_record, obj_id, object_data);
 }
 
 // ===============
@@ -480,8 +444,12 @@ void heap_record_free(heap_record *record) {
 // =================
 // Object Record API
 // =================
-object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_object_data object_data) {
+object_record* object_record_new(VALUE obj_id, heap_record *heap_record, live_object_data object_data) {
   object_record* record = ruby_xcalloc(1, sizeof(object_record));
+  // Could be interesting to store this as a size_t but in theory object ids can be Ruby bignums which
+  // are a pain to handle in C. Since we don't actually care about the id itself keep the VALUE. It
+  // does mean that we need to mark these values to prevent the object ids from becoming invalid.
+  record->obj_id = obj_id;
   record->heap_record = heap_record;
   record->object_data = object_data;
   return record;
@@ -489,6 +457,10 @@ object_record* object_record_new(VALUE new_obj, heap_record *heap_record, live_o
 
 void object_record_free(object_record *record) {
   ruby_xfree(record);
+}
+
+void object_record_mark(object_record *record) {
+  rb_gc_mark(record->obj_id);
 }
 
 // ==============

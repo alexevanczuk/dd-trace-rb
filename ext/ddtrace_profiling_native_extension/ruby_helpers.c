@@ -118,3 +118,39 @@ char* ruby_strndup(const char *str, size_t size) {
 
   return dup;
 }
+
+VALUE _id2ref(VALUE obj_id) {
+  // Call ::ObjectSpace._id2ref natively. It will raise if the id is no longer valid
+  VALUE module_object_space = rb_define_module("ObjectSpace");
+  return rb_funcall(module_object_space, rb_intern("_id2ref"), 1, obj_id);
+}
+
+VALUE _id2ref_failure(VALUE _unused1, VALUE _unused2) {
+  return Qfalse;
+}
+
+// Native wrapper to get an object ref from an id. Returns true on success and
+// writes the ref to the value pointer parameter if !NULL. False if id doesn't
+// reference a valid object (in which case value is not changed).
+bool ruby_ref_from_id(VALUE obj_id, VALUE *value) {
+  // Call ::ObjectSpace._id2ref natively. It will raise if the id is no longer valid
+  // so we need to call it via rb_erscue2
+  VALUE result = rb_rescue2(
+    _id2ref,
+    obj_id,
+    _id2ref_failure,
+    Qnil,
+    rb_eRangeError, // rb_eRangeError is the erorr used to flag invalid ids
+    0 // Required by API to be the last argument
+  );
+
+  if (result == Qfalse) {
+    return false;
+  }
+
+  if (value != NULL) {
+    (*value) = result;
+  }
+
+  return true;
+}

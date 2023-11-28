@@ -205,6 +205,7 @@ static VALUE _native_new(VALUE klass);
 static void initialize_slot_concurrency_control(struct stack_recorder_state *state);
 static void initialize_profiles(struct stack_recorder_state *state, ddog_prof_Slice_ValueType sample_types);
 static void stack_recorder_typed_data_free(void *data);
+static void stack_recorder_typed_data_mark(void *data);
 static VALUE _native_initialize(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE cpu_time_enabled, VALUE alloc_samples_enabled, VALUE heap_samples_enabled);
 static VALUE _native_serialize(VALUE self, VALUE recorder_instance);
 static VALUE ruby_time_from(ddog_Timespec ddprof_time);
@@ -222,7 +223,6 @@ static void serializer_set_start_timestamp_for_next_profile(struct stack_recorde
 static VALUE _native_record_endpoint(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE local_root_span_id, VALUE endpoint);
 static void reset_profile(ddog_prof_Profile *profile, ddog_Timespec *start_time /* Can be null */);
 static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight);
-static VALUE _native_record_obj_free(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE obj);
 
 
 void stack_recorder_init(VALUE profiling_module) {
@@ -248,7 +248,6 @@ void stack_recorder_init(VALUE profiling_module) {
   rb_define_singleton_method(testing_module, "_native_slot_two_mutex_locked?", _native_is_slot_two_mutex_locked, 1);
   rb_define_singleton_method(testing_module, "_native_record_endpoint", _native_record_endpoint, 3);
   rb_define_singleton_method(testing_module, "_native_track_obj_allocation", _native_track_obj_allocation, 3);
-  rb_define_singleton_method(testing_module, "_native_record_obj_free", _native_record_obj_free, 2);
 
   ok_symbol = ID2SYM(rb_intern_const("ok"));
   error_symbol = ID2SYM(rb_intern_const("error"));
@@ -261,7 +260,7 @@ static const rb_data_type_t stack_recorder_typed_data = {
   .function = {
     .dfree = stack_recorder_typed_data_free,
     .dsize = NULL, // We don't track profile memory usage (although it'd be cool if we did!)
-    // No need to provide dmark nor dcompact because we don't directly reference Ruby VALUEs from inside this object
+    .dmark = stack_recorder_typed_data_mark,
   },
   .flags = RUBY_TYPED_FREE_IMMEDIATELY
 };
@@ -333,12 +332,15 @@ static void stack_recorder_typed_data_free(void *state_ptr) {
   pthread_mutex_destroy(&state->slot_two_mutex);
   ddog_prof_Profile_drop(&state->slot_two_profile);
 
-  if (state->heap_recorder != NULL) {
-    // Heap recorder will only be initialized if we're actually collecting heap samples.
-    // If it is initialized we need to free it...
-    heap_recorder_free(state->heap_recorder);
-  }
   ruby_xfree(state);
+}
+
+static void stack_recorder_typed_data_mark(void *state_ptr) {
+  struct stack_recorder_state *state = (struct stack_recorder_state *) state_ptr;
+
+  if (state->heap_recorder != NULL) {
+    heap_recorder_mark(state->heap_recorder);
+  }
 }
 
 static VALUE _native_initialize(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE cpu_time_enabled, VALUE alloc_samples_enabled, VALUE heap_samples_enabled) {
@@ -523,17 +525,6 @@ void track_object(VALUE recorder_instance, VALUE new_object, unsigned int sample
   //        very late in the allocation-sampling path (which is shared with the cpu sampling path). This can
   //        be fixed with some refactoring but for now this leads to a less impactful change.
   start_heap_allocation_recording(state->heap_recorder, new_object, sample_weight);
-}
-
-// WARN: This can get called during Ruby GC. NO HEAP ALLOCATIONS OR EXCEPTIONS ARE ALLOWED.
-void record_obj_free(VALUE recorder_instance, VALUE freed_object) {
-  struct stack_recorder_state *state;
-  TypedData_Get_Struct(recorder_instance, struct stack_recorder_state, &stack_recorder_typed_data, state);
-  if (state->heap_recorder == NULL) {
-    // we aren't gathering heap data so we can ignore this
-    return;
-  }
-  record_heap_free(state->heap_recorder, freed_object);
 }
 
 void record_endpoint(VALUE recorder_instance, uint64_t local_root_span_id, ddog_CharSlice endpoint) {
@@ -744,11 +735,6 @@ static VALUE _native_record_endpoint(DDTRACE_UNUSED VALUE _self, VALUE recorder_
 static VALUE _native_track_obj_allocation(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE new_obj, VALUE weight) {
   ENFORCE_TYPE(weight, T_FIXNUM);
   track_object(recorder_instance, new_obj, NUM2UINT(weight));
-  return Qtrue;
-}
-
-static VALUE _native_record_obj_free(DDTRACE_UNUSED VALUE _self, VALUE recorder_instance, VALUE obj) {
-  record_obj_free(recorder_instance, obj);
   return Qtrue;
 }
 

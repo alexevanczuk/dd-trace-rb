@@ -97,3 +97,8 @@ NORETURN(void raise_syserr(
 //
 // WARN: Cannot be used during GC or outside the GVL.
 char* ruby_strndup(const char *str, size_t size);
+
+// Native wrapper to get an object ref from an id. Returns true on success and
+// writes the ref to the value pointer parameter if !NULL. False if id doesn't
+// reference a valid object (in which case value is not changed).
+bool ruby_ref_from_id(size_t id, VALUE *value);

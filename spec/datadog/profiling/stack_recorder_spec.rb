@@ -343,24 +343,16 @@ RSpec.describe Datadog::Profiling::StackRecorder do
       let(:sample_rate) { 50 }
 
       let(:a_string) { 'a beautiful string' }
-      let(:another_string) { 'a fearsome string' }
       let(:an_array) { [1..10] }
-      let(:another_array) { [-10..-1] }
       let(:a_hash) { { 'a' => 1, 'b' => '2', 'c' => true } }
-      let(:another_hash) { { 'z' => -1, 'y' => '-2', 'x' => false } }
 
-      let(:allocated_objects) do
-        [a_string, an_array, another_string, another_array, a_hash, another_hash]
-      end
-
-      let(:freed_objects) do
-        ['this rando', another_string, 'that rando', 'another rando', another_array, another_hash]
-      end
+      let(:live_objects) { [a_string, an_array, a_hash] }
 
       let(:samples) { samples_from_pprof(encoded_pprof) }
 
       before do
-        allocated_objects.each_with_index do |obj, i|
+        allocations = [a_string, an_array, 'a fearsome string', [-10..-1], a_hash, { 'z' => -1, 'y' => '-2', 'x' => false }]
+        allocations.each_with_index do |obj, i|
           # Heap sampling currently requires this 2-step process to first pass data about the allocated object...
           described_class::Testing._native_track_obj_allocation(stack_recorder, obj, sample_rate)
           # ...and then pass data about the allocation stacktrace (with 2 distinct stacktraces)
@@ -373,9 +365,8 @@ RSpec.describe Datadog::Profiling::StackRecorder do
           end
         end
 
-        freed_objects.each do |obj|
-          described_class::Testing._native_record_obj_free(stack_recorder, obj)
-        end
+        allocations.clear # The literals in the previous array are now dangling
+        GC.start # And this will clear them, leaving only the non-literals which are still pointed to by the lets
       end
 
       context 'when disabled' do
@@ -392,7 +383,6 @@ RSpec.describe Datadog::Profiling::StackRecorder do
         let(:heap_samples_enabled) { true }
 
         it 'are included in the profile' do
-          pending 'free handling is not implemented yet'
           # We sample from 2 distinct locations but heap samples don't have the same
           # labels as the others so they get duped.
           expect(samples.size).to eq(4)

@@ -38,6 +38,9 @@ heap_recorder* heap_recorder_new(void);
 // Free a previously initialized heap recorder.
 void heap_recorder_free(heap_recorder *heap_recorder);
 
+// Mark any Ruby objects referenced by the heap recorder that we don't want GC to claim.
+void heap_recorder_mark(heap_recorder *heap_recorder);
+
 // Start a heap allocation recording on the heap recorder for a new object.
 //
 // This heap allocation recording needs to be ended via ::end_heap_allocation_recording
@@ -60,24 +63,8 @@ void start_heap_allocation_recording(heap_recorder *heap_recorder, VALUE new_obj
 // WARN: It is illegal to call this without previously having called ::start_heap_allocation_recording.
 void end_heap_allocation_recording(heap_recorder *heap_recorder, ddog_prof_Slice_Location locations);
 
-// Record a heap free on the heap recorder.
-//
-// Contrary to heap allocations, no sampling should be applied to frees. Missing a free event
-// risks negatively effecting the accuracy of the live state of tracked objects and thus the accuracy
-// of the resulting profiles.
-//
-// Two things can happen depending on the object:
-// * The object isn't being tracked: the operation is a no-op.
-// * The object is being tracked: it is marked as no longer alive and will not appear in the next
-//   iteration.
-//
-// @param obj The object that was freed.
-//
-// NOTE: This function is safe to be called during a Ruby GC as it guarantees no heap mutations
-//       during its execution.
-void record_heap_free(heap_recorder *heap_recorder, VALUE obj);
-
-// Flush any intermediate state that might be queued inside the heap recorder.
+// Flush any intermediate state that might be queued inside the heap recorder or updates certain
+// state to reflect the latest state of the VM.
 //
 // NOTE: This should usually be called before iteration to ensure data is as little stale as possible.
 void heap_recorder_flush(heap_recorder *heap_recorder);
